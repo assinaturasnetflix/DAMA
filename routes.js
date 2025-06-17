@@ -145,15 +145,23 @@ router.post('/auth/reset-password/:token', async (req, res) => {
 
 router.get('/profile/me', auth, async (req, res) => {
     try {
+        // --- CORREÇÃO APLICADA AQUI ---
         const userProfile = await User.findById(req.user.id)
-            .populate('inventory')
-            .populate('equippedItems.piece_skin')
-            .populate('equippedItems.board_skin')
+            .populate([
+                { path: 'inventory' },
+                { path: 'equippedItems.piece_skin' },
+                { path: 'equippedItems.board_skin' }
+            ])
             .select('-password -__v');
             
-        if (!userProfile) return res.status(404).json({ message: 'Usuário não encontrado.' });
+        if (!userProfile) {
+            return res.status(404).json({ message: 'Usuário não encontrado.' });
+        }
         res.json(userProfile);
-    } catch (error) { res.status(500).json({ message: 'Erro no servidor' }); }
+    } catch (error) {
+        console.error("Erro na rota /profile/me: ", error); // Log do erro no servidor
+        res.status(500).json({ message: 'Erro interno ao buscar dados do perfil.' });
+    }
 });
 
 router.put('/profile/username', auth, async (req, res) => {
