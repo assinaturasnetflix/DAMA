@@ -26,7 +26,12 @@ const io = new Server(server, {
 
 // 5. MIDDLEWARES GLOBAIS DO EXPRESS
 // Habilita o CORS para todas as requisições da API
-app.use(cors());
+// DEPOIS
+app.use(cors({
+  origin: "*", // Para produção, troque "*" pela URL do seu frontend: "https://seu-site.com"
+  methods: "GET,POST,PUT,DELETE,PATCH,OPTIONS", // Métodos permitidos
+  allowedHeaders: "Content-Type, Authorization" // Headers permitidos (ESTA É A PARTE MAIS IMPORTANTE)
+}));
 // Habilita o parsing de JSON no corpo das requisições
 app.use(express.json());
 
