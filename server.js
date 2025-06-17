@@ -1,6 +1,6 @@
-// server.js
+// server.js (com a correção do CORS)
 
-// 1. IMPORTAÇÕES DOS MÓDULOS PRINCIPAIS E DE AMBIENTE
+// 1. IMPORTAÇÕES PRINCIPAIS
 const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
@@ -19,20 +19,18 @@ const server = http.createServer(app);
 // 4. CONFIGURAÇÃO DO SOCKET.IO
 const io = new Server(server, {
     cors: { 
-        origin: "*", // Em produção, mude para o domínio do seu frontend
+        origin: "*",
         methods: ["GET", "POST", "PUT", "DELETE"] 
     }
 });
 
 // 5. MIDDLEWARES GLOBAIS DO EXPRESS
-// Habilita o CORS para todas as requisições da API
-// DEPOIS
+// --- CORREÇÃO DO CORS APLICADA AQUI ---
 app.use(cors({
-  origin: "*", // Para produção, troque "*" pela URL do seu frontend: "https://seu-site.com"
-  methods: "GET,POST,PUT,DELETE,PATCH,OPTIONS", // Métodos permitidos
-  allowedHeaders: "Content-Type, Authorization" // Headers permitidos (ESTA É A PARTE MAIS IMPORTANTE)
+  origin: "*", // Em produção, mude para a URL do seu frontend
+  methods: "GET,POST,PUT,DELETE,PATCH,OPTIONS",
+  allowedHeaders: "Content-Type, Authorization"
 }));
-// Habilita o parsing de JSON no corpo das requisições
 app.use(express.json());
 
 // 6. CONEXÃO COM O BANCO DE DADOS MONGODB
@@ -41,14 +39,9 @@ mongoose.connect(process.env.MONGODB_URI)
     .catch((err) => console.error('❌ Erro ao conectar ao MongoDB:', err));
 
 // 7. INTEGRAÇÃO DOS MÓDULOS DE ROTAS E SOCKET
-// Monta todas as nossas rotas da API sob o prefixo /api
-// Ex: A rota /auth/login em routes.js se torna /api/auth/login
 app.use('/api', apiRoutes);
-
-// Passa a instância do `io` para o nosso módulo de jogo, que vai configurar todos os eventos
 initializeSocket(io);
 
-// Rota de teste para verificar se o servidor HTTP está no ar
 app.get('/', (req, res) => {
     res.send('Servidor da Plataforma de Damas Online está funcionando!');
 });
