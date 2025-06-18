@@ -4,7 +4,7 @@ const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
 const nodemailer = require('nodemailer');
-const { isAuthenticated, isAdmin } = require('./middleware/auth');
+const { isAuthenticated, isAdmin } = require('./middleware');
 const { User, PaymentRequest, GameMatch, Transaction, ResetCode } = require('./models');
 
 // Multer configuration for file uploads
