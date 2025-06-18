@@ -95,10 +95,7 @@ router.post('/auth/forgot-password', async (req, res) => {
 
         const transporter = nodemailer.createTransport({
             service: 'gmail',
-            auth: {
-                user: process.env.EMAIL_USER,
-                pass: process.env.EMAIL_PASS
-            }
+            auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
         });
 
         await transporter.sendMail({
@@ -145,21 +142,14 @@ router.post('/auth/reset-password/:token', async (req, res) => {
 
 router.get('/profile/me', auth, async (req, res) => {
     try {
-        // --- CORREÇÃO APLICADA AQUI ---
         const userProfile = await User.findById(req.user.id)
-            .populate([
-                { path: 'inventory' },
-                { path: 'equippedItems.piece_skin' },
-                { path: 'equippedItems.board_skin' }
-            ])
+            .populate([{ path: 'inventory' }, { path: 'equippedItems.piece_skin' }, { path: 'equippedItems.board_skin' }])
             .select('-password -__v');
             
-        if (!userProfile) {
-            return res.status(404).json({ message: 'Usuário não encontrado.' });
-        }
+        if (!userProfile) return res.status(404).json({ message: 'Usuário não encontrado.' });
         res.json(userProfile);
     } catch (error) {
-        console.error("Erro na rota /profile/me: ", error); // Log do erro no servidor
+        console.error("Erro na rota /profile/me: ", error);
         res.status(500).json({ message: 'Erro interno ao buscar dados do perfil.' });
     }
 });
@@ -168,9 +158,8 @@ router.put('/profile/username', auth, async (req, res) => {
     const { newUsername } = req.body;
     const cost = 100;
     try {
-        if (req.user.balance < cost) return res.status(400).json({ message: 'Saldo insuficiente para alterar o nome.' });
-        if (await User.findOne({ username: newUsername })) return res.status(400).json({ message: 'Este nome de usuário já está em uso.' });
-        
+        if (req.user.balance < cost) return res.status(400).json({ message: 'Saldo insuficiente.' });
+        if (await User.findOne({ username: newUsername })) return res.status(400).json({ message: 'Nome de usuário já em uso.' });
         req.user.username = newUsername;
         req.user.balance -= cost;
         await req.user.save();
@@ -179,16 +168,14 @@ router.put('/profile/username', auth, async (req, res) => {
 });
 
 router.post('/profile/avatar', auth, upload.single('avatar'), async (req, res) => {
-    if (!req.file) return res.status(400).json({ message: 'Nenhum arquivo de imagem enviado.' });
+    if (!req.file) return res.status(400).json({ message: 'Nenhum arquivo enviado.' });
     try {
-        if (req.user.avatar && req.user.avatar.public_id) {
-            await cloudinary.uploader.destroy(req.user.avatar.public_id);
-        }
+        if (req.user.avatar && req.user.avatar.public_id) await cloudinary.uploader.destroy(req.user.avatar.public_id);
         const stream = cloudinary.uploader.upload_stream({ folder: "avatars" }, async (error, result) => {
-            if (error) return res.status(500).json({ message: 'Falha no upload para o Cloudinary' });
+            if (error) return res.status(500).json({ message: 'Falha no upload' });
             req.user.avatar = { public_id: result.public_id, url: result.secure_url };
             await req.user.save();
-            res.json({ message: 'Avatar atualizado com sucesso!', avatarUrl: result.secure_url });
+            res.json({ message: 'Avatar atualizado!', avatarUrl: result.secure_url });
         });
         Readable.from(req.file.buffer).pipe(stream);
     } catch (error) { res.status(500).json({ message: 'Erro no servidor' }); }
@@ -196,10 +183,7 @@ router.post('/profile/avatar', auth, upload.single('avatar'), async (req, res) =
 
 router.get('/ranking', auth, async(req, res) => {
     try {
-        const leaderboard = await User.find({ role: 'user' })
-            .sort({ rankingPoints: -1 })
-            .limit(100)
-            .select('username rankingPoints level stats.wins avatar.url');
+        const leaderboard = await User.find({ role: 'user' }).sort({ rankingPoints: -1 }).limit(100).select('username rankingPoints level stats.wins avatar.url');
         res.json(leaderboard);
     } catch (error) { res.status(500).json({ message: 'Erro ao buscar o ranking.'}); }
 });
@@ -233,7 +217,7 @@ router.post('/inventory/equip', auth, async (req, res) => {
         if (item.type === 'piece_skin') req.user.equippedItems.piece_skin = item._id;
         else if (item.type === 'board_skin') req.user.equippedItems.board_skin = item._id;
         await req.user.save();
-        res.json({ message: `'${item.name}' equipado com sucesso!`, equippedItems: req.user.equippedItems });
+        res.json({ message: `'${item.name}' equipado!`, equippedItems: req.user.equippedItems });
     } catch (error) { res.status(500).json({ message: 'Erro no servidor' }); }
 });
 
@@ -261,6 +245,28 @@ router.post('/payments/withdraw-request', auth, async (req, res) => {
 // ===============================
 // --- ROTAS DO PAINEL DE ADMIN ---
 // ===============================
+
+router.get('/admin/stats', auth, adminAuth, async (req, res) => {
+    try {
+        const [pendingRecharges, pendingWithdrawals, totalUsers, totalItems] = await Promise.all([
+            RechargeRequest.countDocuments({ status: 'pending' }),
+            WithdrawalRequest.countDocuments({ status: 'pending' }),
+            User.countDocuments(),
+            Item.countDocuments()
+        ]);
+        res.json({ pendingRecharges, pendingWithdrawals, totalUsers, totalItems });
+    } catch (error) { res.status(500).json({ message: 'Erro ao buscar estatísticas.' }); }
+});
+
+router.get('/admin/users', auth, adminAuth, async (req, res) => {
+    try {
+        const searchQuery = req.query.search || '';
+        const users = await User.find({
+            $or: [{ username: { $regex: searchQuery, $options: 'i' } }, { email: { $regex: searchQuery, $options: 'i' } }]
+        }).limit(20);
+        res.json(users);
+    } catch (e) { res.status(500).send({ message: 'Erro ao buscar usuários.' }); }
+});
 
 router.get('/admin/recharge-requests', auth, adminAuth, async (req, res) => {
     try { res.json(await RechargeRequest.find({ status: 'pending' }).populate('user', 'username email')); }
@@ -307,5 +313,32 @@ router.post('/admin/users/unblock/:id', auth, adminAuth, async (req, res) => {
     } catch (e) { res.status(500).send(); }
 });
 
-// Exporta o router para ser usado no arquivo principal do servidor
+router.post('/admin/items', auth, adminAuth, upload.single('itemImage'), async (req, res) => {
+    const { name, type, price, identifier } = req.body;
+    if (!name || !type || !price || !identifier || !req.file) {
+        return res.status(400).json({ message: 'Todos os campos, incluindo a imagem, são obrigatórios.' });
+    }
+    try {
+        const result = await new Promise((resolve, reject) => {
+            const stream = cloudinary.uploader.upload_stream({ folder: "items" }, (error, result) => {
+                if (error) reject(error); resolve(result);
+            });
+            Readable.from(req.file.buffer).pipe(stream);
+        });
+        const newItem = new Item({ name, type, price: Number(price), identifier, imageUrl: { public_id: result.public_id, url: result.secure_url } });
+        await newItem.save();
+        res.status(201).json(newItem);
+    } catch (error) { res.status(500).json({ message: 'Erro no servidor ao adicionar item', error: error.message }); }
+});
+
+router.delete('/admin/items/:id', auth, adminAuth, async (req, res) => {
+    try {
+        const item = await Item.findByIdAndDelete(req.params.id);
+        if (!item) return res.status(404).json({ message: "Item não encontrado." });
+        if (item.imageUrl && item.imageUrl.public_id) await cloudinary.uploader.destroy(item.imageUrl.public_id);
+        res.json({ message: "Item removido com sucesso." });
+    } catch (error) { res.status(500).json({ message: 'Erro no servidor ao remover item', error: error.message }); }
+});
+
+
 module.exports = router;
