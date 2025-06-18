@@ -53,43 +53,91 @@ router.post('/auth/register', async (req, res) => {
 });
 
 router.post('/auth/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
+    try {
+        const { email, password } = req.body;
 
-    // Find user and check if blocked
-    const user = await User.findOne({ email });
-    if (!user || user.isBlocked) {
-      return res.status(401).json({ message: 'Invalid credentials or account blocked' });
+        console.log('Tentativa de login:', { email }); // Log para debug
+
+        // Verificar se email e senha foram fornecidos
+        if (!email || !password) {
+            return res.status(400).json({
+                message: 'Email e senha são obrigatórios',
+                success: false
+            });
+        }
+
+        // Procurar usuário por email (case insensitive)
+        const user = await User.findOne({ 
+            email: { $regex: new RegExp(`^${email}$`, 'i') }
+        });
+
+        console.log('Usuário encontrado:', user ? 'Sim' : 'Não'); // Log para debug
+
+        if (!user) {
+            console.log('Usuário não encontrado para o email:', email); // Log para debug
+            return res.status(401).json({
+                message: 'Email ou senha incorretos',
+                success: false
+            });
+        }
+
+        // Verificar se a senha está correta
+        const isMatch = await user.comparePassword(password);
+        console.log('Senha correta:', isMatch ? 'Sim' : 'Não'); // Log para debug
+
+        if (!isMatch) {
+            return res.status(401).json({
+                message: 'Email ou senha incorretos',
+                success: false
+            });
+        }
+
+        // Verificar se a conta está bloqueada
+        if (user.isBlocked) {
+            console.log('Conta bloqueada:', email); // Log para debug
+            return res.status(403).json({
+                message: 'Conta bloqueada. Entre em contato com o suporte',
+                success: false
+            });
+        }
+
+        // Gerar token JWT
+        const token = jwt.sign(
+            { 
+                id: user._id, 
+                role: user.role,
+                email: user.email 
+            },
+            process.env.JWT_SECRET,
+            { expiresIn: '24h' }
+        );
+
+        // Atualizar último login
+        user.lastLogin = new Date();
+        await user.save();
+
+        // Enviar resposta
+        res.json({
+            success: true,
+            token,
+            user: {
+                id: user._id,
+                username: user.username,
+                email: user.email,
+                role: user.role,
+                avatar: user.avatar,
+                balance: user.balance,
+                stats: user.stats
+            }
+        });
+
+    } catch (error) {
+        console.error('Erro no login:', error);
+        res.status(500).json({
+            message: 'Erro ao realizar login. Tente novamente.',
+            success: false
+        });
     }
-
-    // Verify password
-    const isMatch = await user.comparePassword(password);
-    if (!isMatch) {
-      return res.status(401).json({ message: 'Invalid credentials' });
-    }
-
-    // Generate JWT
-    const token = jwt.sign(
-      { id: user._id, role: user.role },
-      process.env.JWT_SECRET,
-      { expiresIn: '24h' }
-    );
-
-    res.json({
-      token,
-      user: {
-        id: user._id,
-        username: user.username,
-        email: user.email,
-        role: user.role,
-        avatar: user.avatar,
-        balance: user.balance,
-        stats: user.stats
-      }
-    });
-  } catch (error) {
-    res.status(500).json({ message: 'Error during login', error: error.message });
-  }
 });
 
 // Profile Routes
