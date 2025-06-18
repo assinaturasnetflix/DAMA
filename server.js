@@ -5,10 +5,10 @@ const cors = require('cors');
 const http = require('http');
 const bodyParser = require('body-parser');
 const cloudinary = require('cloudinary').v2;
-const nodemailer = require('nodemailer'); // Novo require
+const nodemailer = require('nodemailer');
+const rateLimit = require('express-rate-limit'); // Adicione esta linha
 const routes = require('./routes');
 const GameSocket = require('./gameSocket');
-const { createRateLimiter } = require('./middleware/rateLimiter');
 
 // Initialize Express app
 const app = express();
@@ -21,8 +21,8 @@ const requiredEnvVars = [
   'CLOUDINARY_CLOUD_NAME',
   'CLOUDINARY_API_KEY',
   'CLOUDINARY_API_SECRET',
-  'GMAIL_USER',           // Nova variável requerida
-  'GMAIL_APP_PASSWORD'    // Nova variável requerida
+  'GMAIL_USER',
+  'GMAIL_APP_PASSWORD'
 ];
 
 const missingEnvVars = requiredEnvVars.filter(envVar => !process.env[envVar]);
@@ -69,10 +69,14 @@ app.use(cors({
 app.use(bodyParser.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Rate limiting
-const apiLimiter = createRateLimiter({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100 // limit each IP to 100 requests per windowMs
+// Rate limiting (Substituindo a importação do arquivo separado)
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 100, // limite de 100 requisições por windowMs
+  message: {
+    message: 'Muitas requisições deste IP, por favor tente novamente após 15 minutos',
+    success: false
+  }
 });
 
 // Apply rate limiting to all routes
@@ -124,9 +128,7 @@ app.use((req, res) => {
 // Database connection
 mongoose.connect(process.env.MONGODB_URI, {
   useNewUrlParser: true,
-  useUnifiedTopology: true,
-  useCreateIndex: true,
-  useFindAndModify: false
+  useUnifiedTopology: true
 }).then(() => {
   console.log('Connected to MongoDB');
 }).catch((error) => {
