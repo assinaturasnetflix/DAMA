@@ -1,331 +1,751 @@
-// gameSocket.js
-
-const crypto = require('crypto');
+const { Server } = require('socket.io');
 const jwt = require('jsonwebtoken');
-const { User } = require('./models.js'); // Importa apenas o modelo de usuário
+const { User, GameMatch, Transaction } = require('./models');
 
-// --- Variáveis de estado do jogo (em memória) ---
-const openWagers = new Map(); // Armazena apostas abertas: Map<userId, wagerDetails>
-const activeGames = {}; // Armazena jogos ativos: { roomId: gameData }
-const onlineUsers = new Map(); // Armazena usuários online: Map<userId, socketId>
+class GameSocket {
+  constructor(server) {
+    this.io = new Server(server, {
+      cors: {
+        origin: process.env.FRONTEND_URL,
+        credentials: true
+      }
+    });
 
-// --- Constantes de Jogo e Recompensas ---
-const PR_CHANGE = 15; // Pontos de Ranking ganhos/perdidos por partida
-const WINNER_XP = 50; // XP para o vencedor
-const LOSER_XP = 25;  // XP para o perdedor
-const XP_PER_LEVEL = 200; // XP necessário para subir de nível
-const LEVEL_REWARDS = { // Recompensas por nível: Nível -> ID do Item no banco de dados
-    5: '666dd934d47b0a03c3f87f85', // Exemplo de ID de item
-    10: '666dd94ed47b0a03c3f87f88', // Exemplo de ID de item
-};
+    this.matchmakingQueues = new Map(); // Map of bet amounts to arrays of waiting players
+    this.activeGames = new Map(); // Map of room IDs to game states
+    this.playerSockets = new Map(); // Map of user IDs to socket IDs
+    this.setupSocketHandlers();
+  }
 
-// --- Função principal que inicializa toda a lógica do Socket.IO ---
-function initializeSocket(io) {
-
-    // Middleware de autenticação para cada nova conexão de socket
-    io.use((socket, next) => {
-        try {
-            const token = socket.handshake.auth.token;
-            if (!token) throw new Error('Token não fornecido');
-            const decoded = jwt.verify(token, process.env.JWT_SECRET);
-            socket.userId = decoded.id;
-            next();
-        } catch (err) {
-            next(new Error('Erro de autenticação'));
+  setupSocketHandlers() {
+    this.io.use(async (socket, next) => {
+      try {
+        const token = socket.handshake.auth.token;
+        if (!token) {
+          return next(new Error('Authentication error'));
         }
-    });
 
-    // Lida com eventos de cada cliente conectado
-    io.on('connection', (socket) => {
-        console.log(`[Socket] Usuário conectado: ${socket.userId} com ID de socket: ${socket.id}`);
-        onlineUsers.set(socket.userId, socket.id);
-
-        // Envia o estado atual do lobby para o novo usuário
-        socket.emit('updateLobby', Array.from(openWagers.values()));
-
-        // --- Lógica do Lobby de Apostas ---
-        socket.on('hostWageredGame', async ({ betAmount }) => {
-            try {
-                const user = await User.findById(socket.userId);
-                if (!user || user.balance < betAmount || betAmount <= 0) {
-                    return socket.emit('error', { message: 'Saldo insuficiente ou valor de aposta inválido.' });
-                }
-                if (openWagers.has(socket.userId)) {
-                    return socket.emit('error', { message: 'Você já tem uma aposta aberta.' });
-                }
-
-                const wagerDetails = {
-                    userId: user._id.toString(),
-                    username: user.username,
-                    rankingPoints: user.rankingPoints,
-                    betAmount,
-                };
-                openWagers.set(socket.userId, wagerDetails);
-                // Notifica todos os clientes sobre a nova aposta no lobby
-                io.emit('updateLobby', Array.from(openWagers.values()));
-            } catch(e) { socket.emit('error', { message: 'Erro ao criar aposta.' }); }
-        });
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const user = await User.findById(decoded.id).select('-password');
         
-        socket.on('cancelWager', () => {
-            if (openWagers.has(socket.userId)) {
-                openWagers.delete(socket.userId);
-                io.emit('updateLobby', Array.from(openWagers.values()));
-            }
-        });
+        if (!user || user.isBlocked) {
+          return next(new Error('User not found or blocked'));
+        }
 
-        socket.on('acceptWager', async ({ hostUserId }) => {
-            const hostWager = openWagers.get(hostUserId);
-            if (!hostWager) return socket.emit('error', { message: 'Este jogador não está mais esperando por um oponente.' });
-            
-            const challenger = await User.findById(socket.userId);
-            if (!challenger) return socket.emit('error', { message: 'Erro ao encontrar seu usuário.' });
-            if (challenger.balance < hostWager.betAmount) {
-                return socket.emit('error', { message: 'Você não tem saldo suficiente para aceitar esta aposta.' });
-            }
-            if (challenger._id.toString() === hostUserId) {
-                 return socket.emit('error', { message: 'Você não pode jogar contra si mesmo.' });
-            }
-
-            openWagers.delete(hostUserId);
-            io.emit('updateLobby', Array.from(openWagers.values()));
-
-            const betAmount = hostWager.betAmount;
-            try {
-                await Promise.all([
-                    User.findByIdAndUpdate(hostUserId, { $inc: { balance: -betAmount } }),
-                    User.findByIdAndUpdate(challenger._id, { $inc: { balance: -betAmount } })
-                ]);
-            } catch (error) {
-                return io.to(socket.id).to(hostWager.socketId).emit('error', { message: 'Erro ao processar apostas, a partida foi cancelada.'});
-            }
-
-            const hostSocket = io.sockets.sockets.get(onlineUsers.get(hostUserId));
-            if (!hostSocket) return socket.emit('error', { message: 'Oponente desconectou.' });
-            
-            const roomId = `game_${crypto.randomBytes(4).toString('hex')}`;
-            hostSocket.join(roomId);
-            socket.join(roomId);
-
-            const gameData = {
-                roomId,
-                board: [
-                    [null,'r',null,'r',null,'r',null,'r'],['r',null,'r',null,'r',null,'r',null],[null,'r',null,'r',null,'r',null,'r'],
-                    [null,null,null,null,null,null,null,null],[null,null,null,null,null,null,null,null],
-                    ['b',null,'b',null,'b',null,'b',null],[null,'b',null,'b',null,'b',null,'b'],['b',null,'b',null,'b',null,'b',null]
-                ],
-                players: [
-                    { userId: hostUserId, username: hostWager.username, color: 'b' },
-                    { userId: challenger._id.toString(), username: challenger.username, color: 'r' }
-                ],
-                turnIndex: 0,
-                isFinished: false,
-                pot: betAmount * 2
-            };
-            activeGames[roomId] = gameData;
-            io.to(roomId).emit('matchFound', gameData);
-        });
-
-        // --- Lógica do Jogo ---
-        socket.on('makeMove', (data) => handleMakeMove(io, socket, data));
-
-        // --- Desconexão ---
-        socket.on('disconnect', () => handleDisconnect(io, socket.userId));
+        socket.user = user;
+        next();
+      } catch (error) {
+        next(new Error('Authentication error'));
+      }
     });
-}
 
+    this.io.on('connection', (socket) => {
+      console.log(`User connected: ${socket.user.username}`);
+      this.playerSockets.set(socket.user.id.toString(), socket.id);
 
-// ===================================
-// === MOTOR DE REGRAS DE DAMAS ======
-// ===================================
+      socket.on('findMatch', (data) => this.handleFindMatch(socket, data));
+      socket.on('cancelFindMatch', () => this.handleCancelFindMatch(socket));
+      socket.on('createPrivateRoom', (data) => this.handleCreatePrivateRoom(socket, data));
+      socket.on('joinPrivateRoom', (data) => this.handleJoinPrivateRoom(socket, data));
+      socket.on('makeMove', (data) => this.handleGameMove(socket, data));
+      socket.on('surrender', () => this.handleSurrender(socket));
+      socket.on('disconnect', () => this.handleDisconnect(socket));
 
-function calculateRawMoves(board, row, col) {
+      // Additional event handlers
+      socket.on('requestGameState', () => this.handleGameStateRequest(socket));
+      socket.on('requestAvailableMoves', (position) => this.handleAvailableMovesRequest(socket, position));
+    });
+  }
+
+  async handleFindMatch(socket, { betAmount }) {
+    try {
+      const user = socket.user;
+      
+      if (betAmount < 0 || user.balance < betAmount) {
+        return socket.emit('error', { message: 'Insufficient balance' });
+      }
+
+      if (this.isPlayerInQueue(user.id) || this.isPlayerInGame(user.id)) {
+        return socket.emit('error', { message: 'Already in queue or game' });
+      }
+
+      const queueKey = betAmount.toString();
+      if (!this.matchmakingQueues.has(queueKey)) {
+        this.matchmakingQueues.set(queueKey, []);
+      }
+
+      const queue = this.matchmakingQueues.get(queueKey);
+      
+      if (queue.length > 0) {
+        const opponent = queue.shift();
+        await this.createMatch(user, opponent, betAmount);
+      } else {
+        queue.push({
+          id: user.id,
+          username: user.username,
+          socketId: socket.id
+        });
+        socket.emit('waitingForMatch');
+      }
+    } catch (error) {
+      socket.emit('error', { message: 'Error finding match' });
+    }
+  }
+
+  handleCancelFindMatch(socket) {
+    const userId = socket.user.id;
+    this.removePlayerFromQueue(userId);
+    socket.emit('matchCancelled');
+  }
+
+  async handleCreatePrivateRoom(socket, { betAmount = 0 }) {
+    try {
+      const user = socket.user;
+      
+      if (betAmount > 0 && user.balance < betAmount) {
+        return socket.emit('error', { message: 'Insufficient balance' });
+      }
+
+      const roomCode = this.generateRoomCode();
+      const gameState = this.createGameState({
+        roomCode,
+        isPrivate: true,
+        betAmount,
+        creator: user
+      });
+
+      this.activeGames.set(roomCode, gameState);
+      socket.join(roomCode);
+      
+      socket.emit('privateRoomCreated', {
+        roomCode,
+        betAmount
+      });
+    } catch (error) {
+      socket.emit('error', { message: 'Error creating private room' });
+    }
+  }
+
+  async handleJoinPrivateRoom(socket, { roomCode }) {
+    try {
+      const user = socket.user;
+      const gameState = this.activeGames.get(roomCode);
+
+      if (!gameState) {
+        return socket.emit('error', { message: 'Room not found' });
+      }
+
+      if (gameState.players.length >= 2) {
+        return socket.emit('error', { message: 'Room is full' });
+      }
+
+      if (gameState.betAmount > user.balance) {
+        return socket.emit('error', { message: 'Insufficient balance' });
+      }
+
+      await this.addPlayerToGame(gameState, user);
+      socket.join(roomCode);
+      
+      this.startGame(gameState);
+    } catch (error) {
+      socket.emit('error', { message: 'Error joining private room' });
+    }
+  }
+
+  async handleSurrender(socket) {
+    try {
+      const user = socket.user;
+      const gameState = this.findGameByPlayerId(user.id);
+
+      if (!gameState) {
+        return socket.emit('error', { message: 'No active game' });
+      }
+
+      const winner = gameState.players.find(p => p.id !== user.id);
+      await this.handleGameOver(gameState, winner.id);
+    } catch (error) {
+      socket.emit('error', { message: 'Error processing surrender' });
+    }
+  }
+
+  handleDisconnect(socket) {
+    const userId = socket.user.id;
+    this.removePlayerFromQueue(userId);
+    
+    const gameState = this.findGameByPlayerId(userId);
+    if (gameState) {
+      this.handlePlayerDisconnect(gameState, userId);
+    }
+
+    this.playerSockets.delete(userId);
+  }
+
+  createGameState({ roomCode, matchId = null, isPrivate = false, betAmount = 0, creator = null, players = [] }) {
+    return {
+      roomCode,
+      matchId,
+      isPrivate,
+      betAmount,
+      creator: creator?.id,
+      players: players.map(p => ({
+        id: p.id,
+        username: p.username
+      })),
+      board: this.createInitialBoard(),
+      currentTurn: null,
+      moveHistory: [],
+      lastMove: null,
+      gameStats: this.calculateGameStats(this.createInitialBoard())
+    };
+  }
+
+  createInitialBoard() {
+    const board = Array(8).fill(null).map(() => Array(8).fill(null));
+    
+    // Place black pieces (b)
+    for (let row = 5; row < 8; row++) {
+      for (let col = 0; col < 8; col++) {
+        if ((row + col) % 2 === 1) {
+          board[row][col] = 'b';
+        }
+      }
+    }
+    
+    // Place red pieces (r)
+    for (let row = 0; row < 3; row++) {
+      for (let col = 0; col < 8; col++) {
+        if ((row + col) % 2 === 1) {
+          board[row][col] = 'r';
+        }
+      }
+    }
+    
+    return board;
+  }
+
+  calculateGameStats(board) {
+    const stats = {
+      black_pieces_count: 0,
+      black_kings_count: 0,
+      red_pieces_count: 0,
+      red_kings_count: 0
+    };
+
+    for (let row = 0; row < 8; row++) {
+      for (let col = 0; col < 8; col++) {
+        const piece = board[row][col];
+        if (piece === 'b') stats.black_pieces_count++;
+        else if (piece === 'B') stats.black_kings_count++;
+        else if (piece === 'r') stats.red_pieces_count++;
+        else if (piece === 'R') stats.red_kings_count++;
+      }
+    }
+
+    return stats;
+  }
+
+  async handleGameMove(socket, { from, to }) {
+    try {
+      const user = socket.user;
+      const gameState = this.findGameByPlayerId(user.id);
+
+      if (!gameState) {
+        return socket.emit('error', { message: 'No active game' });
+      }
+
+      const playerIndex = gameState.players.findIndex(p => p.id === user.id);
+      const playerColor = playerIndex === 0 ? 'b' : 'r';
+
+      if (gameState.currentTurn !== user.id) {
+        return socket.emit('error', { message: 'Not your turn' });
+      }
+
+      if (gameState.lastMove && gameState.lastMove.playerId === user.id) {
+        if (from.row !== gameState.lastMove.endRow || from.col !== gameState.lastMove.endCol) {
+          return socket.emit('error', { message: 'Must continue capture sequence with the same piece' });
+        }
+      }
+
+      const availableCaptures = this.findAllCaptures(gameState.board, playerColor);
+      if (availableCaptures.length > 0) {
+        const isCapture = this.isCaptureMove(gameState.board, from, to);
+        if (!isCapture) {
+          return socket.emit('error', { message: 'Capture move is mandatory' });
+        }
+      }
+
+      if (!this.isValidMove(gameState, from, to, playerColor)) {
+        return socket.emit('error', { message: 'Invalid move' });
+      }
+
+      const moveResult = this.applyMove(gameState, from, to, playerColor);
+      gameState.gameStats = this.calculateGameStats(gameState.board);
+
+      await GameMatch.findByIdAndUpdate(gameState.matchId, {
+        $push: {
+          moves: {
+            from,
+            to,
+            player: user.id
+          }
+        }
+      });
+
+      this.io.to(gameState.roomCode).emit('moveApplied', {
+        from,
+        to,
+        player: user.id,
+        gameStats: gameState.gameStats,
+        capturedPiece: moveResult.capturedPiece
+      });
+
+      const moreCapturesAvailable = moveResult.isCapture && 
+        this.findCapturesForPiece(gameState.board, to.row, to.col).length > 0;
+
+      if (moreCapturesAvailable) {
+        gameState.lastMove = {
+          playerId: user.id,
+          endRow: to.row,
+          endCol: to.col
+        };
+        socket.emit('continuedTurn', { message: 'Additional captures available' });
+      } else {
+        gameState.lastMove = null;
+        gameState.currentTurn = gameState.players.find(p => p.id !== user.id).id;
+        this.io.to(gameState.roomCode).emit('turnChanged', {
+          currentTurn: gameState.currentTurn
+        });
+      }
+
+      if (this.isGameOver(gameState)) {
+        await this.handleGameOver(gameState);
+      }
+    } catch (error) {
+      socket.emit('error', { message: 'Error processing move' });
+    }
+  }
+
+  isValidMove(gameState, from, to, playerColor) {
+    const { board } = gameState;
+    const piece = board[from.row][from.col];
+
+    if (!piece || piece.toLowerCase() !== playerColor) return false;
+    if (board[to.row][to.col] !== null) return false;
+
+    const isKing = piece === piece.toUpperCase();
+    const moveDistance = {
+      row: Math.abs(to.row - from.row),
+      col: Math.abs(to.col - from.col)
+    };
+
+    if (moveDistance.row !== moveDistance.col) return false;
+
+    if (moveDistance.row === 1) {
+      if (!isKing) {
+        const forward = playerColor === 'b' ? -1 : 1;
+        return (to.row - from.row) === forward;
+      }
+      return true;
+    }
+
+    return this.isValidCapture(board, from, to, playerColor, isKing);
+  }
+
+  isValidCapture(board, from, to, playerColor, isKing) {
+    const captureRow = Math.floor((from.row + to.row) / 2);
+    const captureCol = Math.floor((from.col + to.col) / 2);
+    const capturedPiece = board[captureRow][captureCol];
+
+    if (!capturedPiece || capturedPiece.toLowerCase() === playerColor) return false;
+
+    if (isKing) {
+      const rowStep = Math.sign(to.row - from.row);
+      const colStep = Math.sign(to.col - from.col);
+      let row = from.row + rowStep;
+      let col = from.col + colStep;
+      let foundCapture = false;
+
+      while (row !== to.row && col !== to.col) {
+        if (board[row][col] !== null) {
+          if (foundCapture) return false;
+          if (board[row][col].toLowerCase() === playerColor) return false;
+          foundCapture = true;
+        }
+        row += rowStep;
+        col += colStep;
+      }
+
+      return foundCapture;
+    }
+
+    return Math.abs(to.row - from.row) === 2;
+  }
+
+  findAllCaptures(board, playerColor) {
+    const captures = [];
+    
+    for (let row = 0; row < 8; row++) {
+      for (let col = 0; col < 8; col++) {
+        const piece = board[row][col];
+        if (piece && piece.toLowerCase() === playerColor) {
+          const pieceCaptures = this.findCapturesForPiece(board, row, col);
+          captures.push(...pieceCaptures);
+        }
+      }
+    }
+    
+    return captures;
+  }
+
+  findCapturesForPiece(board, row, col) {
     const piece = board[row][col];
     if (!piece) return [];
-    
-    const moves = [];
-    const isKing = piece === 'B' || piece === 'R';
-    const opponent = piece.toLowerCase() === 'b' ? 'r' : 'b';
-    const moveDirections = (piece === 'b') ? [[-1, -1], [-1, 1]] : (piece === 'r') ? [[1, -1], [1, 1]] : [];
-    const captureDirections = [[-1, -1], [-1, 1], [1, -1], [1, 1]];
 
-    // Movimentos simples
+    const playerColor = piece.toLowerCase();
+    const isKing = piece === piece.toUpperCase();
+    const captures = [];
+
     if (isKing) {
-        for (const [dr, dc] of captureDirections) {
-            for (let i = 1; i < 8; i++) {
-                const destRow = row + i * dr, destCol = col + i * dc;
-                if (destRow < 0 || destRow >= 8 || destCol < 0 || destCol >= 8 || board[destRow][destCol] !== null) break;
-                moves.push({ from: {row, col}, to: { row: destRow, col: destCol }, isJump: false, captured: [] });
+      const directions = [[1, 1], [1, -1], [-1, 1], [-1, -1]];
+      for (const [rowDir, colDir] of directions) {
+        let r = row + rowDir;
+        let c = col + colDir;
+        let foundOpponent = false;
+        let opponentPos = null;
+
+        while (r >= 0 && r < 8 && c >= 0 && c < 8) {
+          if (board[r][c] !== null) {
+            if (!foundOpponent && board[r][c].toLowerCase() !== playerColor) {
+              foundOpponent = true;
+              opponentPos = { row: r, col: c };
+            } else {
+              break;
             }
+          } else if (foundOpponent) {
+            captures.push({
+              from: { row, col },
+              to: { row: r, col: c },
+              captured: opponentPos
+            });
+          }
+          r += rowDir;
+          c += colDir;
         }
+      }
     } else {
-        for (const [dr, dc] of moveDirections) {
-            const destRow = row + dr, destCol = col + dc;
-            if (destRow >= 0 && destRow < 8 && destCol >= 0 && destCol < 8 && board[destRow][destCol] === null) {
-                moves.push({ from: {row, col}, to: { row: destRow, col: destCol }, isJump: false, captured: [] });
-            }
-        }
-    }
-
-    // Capturas
-    for (const [dr, dc] of captureDirections) {
-        if (isKing) {
-            let capturedPiece = null;
-            for (let i = 1; i < 8; i++) {
-                const checkRow = row + i * dr, checkCol = col + i * dc;
-                if (checkRow < 0 || checkRow >= 8 || checkCol < 0 || checkCol >= 8) break;
-                const squareContent = board[checkRow][checkCol];
-                if (squareContent) {
-                    if (squareContent.toLowerCase() === opponent && !capturedPiece) capturedPiece = { row: checkRow, col: checkCol };
-                    else break;
-                } else if (capturedPiece) {
-                    moves.push({ from: {row, col}, to: { row: checkRow, col: checkCol }, isJump: true, captured: [capturedPiece] });
-                }
-            }
-        } else {
-            const middleRow = row + dr, middleCol = col + dc;
-            const destRow = row + 2 * dr, destCol = col + 2 * dc;
-            if (destRow >= 0 && destRow < 8 && destCol >= 0 && destCol < 8 && board[destRow][destCol] === null && board[middleRow]?.[middleCol]?.toLowerCase() === opponent) {
-                moves.push({ from: {row, col}, to: { row: destRow, col: destCol }, isJump: true, captured: [{ row: middleRow, col: middleCol }] });
-            }
-        }
-    }
-    return moves;
-}
-
-function findAllPossibleMoves(board, playerColor) {
-    let allMoves = [];
-    for (let r = 0; r < 8; r++) {
-        for (let c = 0; c < 8; c++) {
-            if (board[r][c] && board[r][c].toLowerCase() === playerColor) {
-                allMoves.push(...calculateRawMoves(board, r, c));
-            }
-        }
-    }
-    const jumpMoves = allMoves.filter(m => m.isJump);
-    return jumpMoves.length > 0 ? jumpMoves : allMoves;
-}
-
-function updateBoardState(board, move) {
-    const { from, to, captured } = move;
-    let pieceType = board[from.row][from.col];
-    if ((pieceType === 'b' && to.row === 0) || (pieceType === 'r' && to.row === 7)) {
-        pieceType = pieceType.toUpperCase();
-    }
-    board[to.row][to.col] = pieceType;
-    board[from.row][from.col] = null;
-    captured.forEach(p => { board[p.row][p.col] = null; });
-}
-
-function checkWinCondition(board, nextPlayerColor) {
-    const opponentColor = nextPlayerColor === 'b' ? 'r' : 'b';
-    const opponentPieces = board.flat().filter(p => p?.toLowerCase() === opponentColor).length;
-    if (opponentPieces === 0) return nextPlayerColor;
-    
-    const nextPlayerMoves = findAllPossibleMoves(board, nextPlayerColor);
-    if (nextPlayerMoves.length === 0) return opponentColor;
-    
-    return null;
-}
-
-
-// =======================================
-// === GERENCIAMENTO DO CICLO DE JOGO ====
-// =======================================
-
-async function handleMakeMove(io, socket, { roomId, move }) {
-    try {
-        const game = activeGames[roomId];
-        if (!game || socket.userId !== game.players[game.turnIndex].userId) return;
-
-        const currentPlayer = game.players[game.turnIndex];
-        const legalMoves = findAllPossibleMoves(game.board, currentPlayer.color);
-        const attemptedMove = legalMoves.find(m => m.from.row === move.from.row && m.from.col === move.from.col && m.to.row === move.to.row && m.to.col === move.to.col);
-
-        if (!attemptedMove) return socket.emit('error', { message: "Movimento ilegal!" });
-
-        updateBoardState(game.board, attemptedMove);
-        const furtherJumps = attemptedMove.isJump ? calculateRawMoves(game.board, move.to.row, move.to.col).filter(m => m.isJump) : [];
-
-        if (furtherJumps.length > 0) {
-            io.to(roomId).emit('gameStateUpdate', { board: game.board, turn: currentPlayer.color });
-        } else {
-            game.turnIndex = 1 - game.turnIndex;
-            const nextPlayer = game.players[game.turnIndex];
-            io.to(roomId).emit('gameStateUpdate', { board: game.board, turn: nextPlayer.color });
-            
-            const winnerColor = checkWinCondition(game.board, nextPlayer.color);
-            if (winnerColor) await handleGameOver(io, roomId, winnerColor);
-        }
-    } catch (error) { console.error("Error in handleMakeMove:", error); }
-}
-
-async function handleGameOver(io, roomId, winnerColor) {
-    const game = activeGames[roomId];
-    if (!game || game.isFinished) return;
-    game.isFinished = true;
-
-    const winner = game.players.find(p => p.color === winnerColor);
-    const loser = game.players.find(p => p.color !== winnerColor);
-
-    if (!winner || !loser) return delete activeGames[roomId];
-
-    try {
-        const winnerUpdatePromise = User.findByIdAndUpdate(winner.userId, { 
-            $inc: { 'stats.wins': 1, rankingPoints: PR_CHANGE, xp: WINNER_XP, balance: game.pot }
-        }, { new: true });
-
-        const loserUpdatePromise = User.findByIdAndUpdate(loser.userId, { 
-            $inc: { 'stats.losses': 1, rankingPoints: -PR_CHANGE, xp: LOSER_XP }
-        }, { new: true });
+      const directions = [[-2, -2], [-2, 2], [2, -2], [2, 2]];
+      for (const [rowDiff, colDiff] of directions) {
+        const newRow = row + rowDiff;
+        const newCol = col + colDiff;
         
-        const [winnerDoc, loserDoc] = await Promise.all([winnerUpdatePromise, loserUpdatePromise]);
-
-        io.to(roomId).emit('gameOver', { winnerUsername: winnerDoc.username, pot: game.pot });
-
-        if (winnerDoc) await checkLevelUp(io, winnerDoc);
-        if (loserDoc) await checkLevelUp(io, loserDoc);
-
-    } catch (error) { console.error("Erro ao finalizar jogo:", error); }
-    finally {
-        delete activeGames[roomId];
-    }
-}
-
-async function handleDisconnect(io, userId) {
-    console.log(`[Socket] Usuário desconectado: ${userId}`);
-    onlineUsers.delete(userId);
-    if(openWagers.has(userId)){
-        openWagers.delete(userId);
-        io.emit('updateLobby', Array.from(openWagers.values()));
-    }
-    const roomId = Object.keys(activeGames).find(key => activeGames[key]?.players.some(p => p.userId === userId));
-    if (roomId && !activeGames[roomId].isFinished) {
-        const game = activeGames[roomId];
-        const remainingPlayer = game.players.find(p => p.userId !== userId);
-        if (remainingPlayer) await handleGameOver(io, roomId, remainingPlayer.color);
-    }
-}
-
-async function checkLevelUp(io, user) {
-    if (user.xp >= XP_PER_LEVEL) {
-        const newLevel = user.level + 1;
-        const newXp = user.xp % XP_PER_LEVEL;
-        const updateData = { level: newLevel, xp: newXp, $addToSet: {} };
-
-        const rewardItemId = LEVEL_REWARDS[newLevel];
-        if (rewardItemId) {
-            updateData.$addToSet.inventory = rewardItemId;
-        } else {
-            delete updateData.$addToSet;
+        if (newRow >= 0 && newRow < 8 && newCol >= 0 && newCol < 8 && board[newRow][newCol] === null) {
+          const jumpRow = row + rowDiff/2;
+          const jumpCol = col + colDiff/2;
+          const jumpedPiece = board[jumpRow][jumpCol];
+          
+          if (jumpedPiece && jumpedPiece.toLowerCase() !== playerColor) {
+            captures.push({
+              from: { row, col },
+              to: { row: newRow, col: newCol },
+              captured: { row: jumpRow, col: jumpCol }
+            });
+          }
         }
-
-        await User.findByIdAndUpdate(user._id, updateData);
-        const socketId = onlineUsers.get(user._id.toString());
-        if (socketId) {
-            io.to(socketId).emit('levelUp', { newLevel, reward: rewardItemId ? "Você ganhou um novo item!" : null });
-        }
+      }
     }
+
+    return captures;
+  }
+
+  applyMove(gameState, from, to, playerColor) {
+    const { board } = gameState;
+    const piece = board[from.row][from.col];
+    const moveResult = {
+      isCapture: false,
+      capturedPiece: null
+    };
+
+    board[to.row][to.col] = piece;
+    board[from.row][from.col] = null;
+
+    if (Math.abs(to.row - from.row) >= 2) {
+      const captureRow = Math.floor((from.row + to.row) / 2);
+      const captureCol = Math.floor((from.col + to.col) / 2);
+      moveResult.capturedPiece = board[captureRow][captureCol];
+      board[captureRow][captureCol] = null;
+      moveResult.isCapture = true;
+    }
+
+    const lastRow = playerColor === 'b' ? 0 : 7;
+    if (to.row === lastRow && piece === playerColor) {
+      board[to.row][to.col] = piece.toUpperCase();
+    }
+
+    return moveResult;
+  }
+
+  isGameOver(gameState) {
+    const nextPlayer = gameState.currentTurn;
+    const playerColor = gameState.players[0].id === nextPlayer ? 'b' : 'r';
+
+    const hasPieces = gameState.board.some(row => 
+      row.some(cell => cell && cell.toLowerCase() === playerColor)
+    );
+
+    if (!hasPieces) return true;
+
+    for (let row = 0; row < 8; row++) {
+      for (let col = 0; col < 8; col++) {
+        const piece = gameState.board[row][col];
+        if (piece && piece.toLowerCase() === playerColor) {
+          if (this.findCapturesForPiece(gameState.board, row, col).length > 0) {
+            return false;
+          }
+
+          const isKing = piece === piece.toUpperCase();
+          const directions = isKing ? [-1, 1] : [playerColor === 'b' ? -1 : 1];
+          
+          for (const rowDir of directions) {
+            for (const colDir of [-1, 1]) {
+              const newRow = row + rowDir;
+              const newCol = col + colDir;
+              
+              if (newRow >= 0 && newRow < 8 && newCol >= 0 && newCol < 8 && 
+                  gameState.board[newRow][newCol] === null) {
+                return false;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return true;
+  }
+
+  // Helper methods
+  async createMatch(player1, player2, betAmount) {
+    try {
+      const match = new GameMatch({
+        players: [
+          { user: player1.id },
+          { user: player2.id }
+        ],
+        betAmount,
+        status: 'active',
+        startTime: new Date()
+      });
+      await match.save();
+
+      await Promise.all([
+        this.deductBet(player1.id, betAmount),
+        this.deductBet(player2.id, betAmount)
+      ]);
+
+      const gameState = this.createGameState({
+        matchId: match._id,
+        roomCode: match._id.toString(),
+        betAmount,
+        players: [player1, player2]
+      });
+
+      this.activeGames.set(gameState.roomCode, gameState);
+
+      const player1Socket = this.io.sockets.sockets.get(this.playerSockets.get(player1.id));
+      const player2Socket = this.io.sockets.sockets.get(this.playerSockets.get(player2.id));
+
+      player1Socket?.join(gameState.roomCode);
+      player2Socket?.join(gameState.roomCode);
+
+      this.startGame(gameState);
+    } catch (error) {
+      console.error('Error creating match:', error);
+      throw error;
+    }
+  }
+
+  async deductBet(userId, amount) {
+    const user = await User.findById(userId);
+    user.balance -= amount;
+    await user.save();
+
+    await Transaction.create({
+      user: userId,
+      type: 'bet',
+      amount: -amount,
+      description: 'Game bet placed',
+      balanceAfter: user.balance
+    });
+  }
+
+  async handleGameOver(gameState, forcedWinnerId = null) {
+    try {
+      const match = await GameMatch.findById(gameState.matchId);
+      const winner = forcedWinnerId || this.determineWinner(gameState);
+      const totalPrize = gameState.betAmount * 2;
+
+      match.status = 'completed';
+      match.winner = winner;
+      match.endTime = new Date();
+      await match.save();
+
+      const winnerUser = await User.findById(winner);
+      winnerUser.stats.wins += 1;
+      winnerUser.balance += totalPrize;
+      winnerUser.totalWinnings += totalPrize;
+      await winnerUser.save();
+
+      const loser = gameState.players.find(p => p.id !== winner);
+      const loserUser = await User.findById(loser.id);
+      loserUser.stats.losses += 1;
+      await loserUser.save();
+
+      await Transaction.create({
+        user: winner,
+        type: 'win',
+        amount: totalPrize,
+        description: 'Game won',
+        relatedMatch: match._id,
+        balanceAfter: winnerUser.balance
+      });
+
+      this.io.to(gameState.roomCode).emit('gameOver', {
+        winner,
+        prize: totalPrize
+      });
+
+      this.activeGames.delete(gameState.roomCode);
+    } catch (error) {
+      console.error('Error handling game over:', error);
+      throw error;
+    }
+  }
+
+  generateRoomCode() {
+    return Math.random().toString(36).substring(2, 8).toUpperCase();
+  }
+
+  isPlayerInQueue(userId) {
+    for (const queue of this.matchmakingQueues.values()) {
+      if (queue.some(p => p.id === userId)) return true;
+    }
+    return false;
+  }
+
+  isPlayerInGame(userId) {
+    for (const game of this.activeGames.values()) {
+      if (game.players.some(p => p.id === userId)) return true;
+    }
+    return false;
+  }
+
+  removePlayerFromQueue(userId) {
+    for (const queue of this.matchmakingQueues.values()) {
+      const index = queue.findIndex(p => p.id === userId);
+      if (index !== -1) {
+        queue.splice(index, 1);
+      }
+    }
+  }
+
+  findGameByPlayerId(userId) {
+    for (const game of this.activeGames.values()) {
+      if (game.players.some(p => p.id === userId)) return game;
+    }
+    return null;
+  }
+
+  handlePlayerDisconnect(gameState, userId) {
+    if (gameState.players.length < 2) {
+      this.activeGames.delete(gameState.roomCode);
+    } else {
+      const winner = gameState.players.find(p => p.id !== userId);
+      this.handleGameOver(gameState, winner.id);
+    }
+  }
+
+  // Additional helper methods for new features
+  handleGameStateRequest(socket) {
+    const gameState = this.findGameByPlayerId(socket.user.id);
+    if (gameState) {
+      socket.emit('gameState', {
+        board: gameState.board,
+        currentTurn: gameState.currentTurn,
+        gameStats: gameState.gameStats
+      });
+    }
+  }
+
+  handleAvailableMovesRequest(socket, position) {
+    const gameState = this.findGameByPlayerId(socket.user.id);
+    if (!gameState || gameState.currentTurn !== socket.user.id) {
+      return socket.emit('error', { message: 'Not your turn' });
+    }
+
+    const playerColor = gameState.players[0].id === socket.user.id ? 'b' : 'r';
+    const piece = gameState.board[position.row][position.col];
+
+    if (!piece || piece.toLowerCase() !== playerColor) {
+      return socket.emit('availableMoves', []);
+    }
+
+    const captures = this.findCapturesForPiece(gameState.board, position.row, position.col);
+    if (captures.length > 0) {
+      return socket.emit('availableMoves', captures);
+    }
+
+    const regularMoves = this.findRegularMoves(gameState.board, position.row, position.col);
+    socket.emit('availableMoves', regularMoves);
+  }
+
+  findRegularMoves(board, row, col) {
+    const piece = board[row][col];
+    if (!piece) return [];
+
+    const moves = [];
+    const playerColor = piece.toLowerCase();
+    const isKing = piece === piece.toUpperCase();
+
+    if (isKing) {
+      // King can move in all diagonal directions
+      const directions = [[1, 1], [1, -1], [-1, 1], [-1, -1]];
+      for (const [rowDir, colDir] of directions) {
+        let r = row + rowDir;
+        let c = col + colDir;
+        
+        while (r >= 0 && r < 8 && c >= 0 && c < 8 && board[r][c] === null) {
+          moves.push({
+            from: { row, col },
+            to: { row: r, col: c }
+          });
+          r += rowDir;
+          c += colDir;
+        }
+      }
+    } else {
+      // Regular piece moves
+      const forward = playerColor === 'b' ? -1 : 1;
+      const possibleMoves = [
+        [forward, -1],
+        [forward, 1]
+      ];
+
+      for (const [rowDiff, colDiff] of possibleMoves) {
+        const newRow = row + rowDiff;
+        const newCol = col + colDiff;
+        
+        if (newRow >= 0 && newRow < 8 && newCol >= 0 && newCol < 8 && 
+            board[newRow][newCol] === null) {
+          moves.push({
+            from: { row, col },
+            to: { row: newRow, col: newCol }
+          });
+        }
+      }
+    }
+
+    return moves;
+  }
 }
 
-// Exporta a função de inicialização
-module.exports = initializeSocket;
+module.exports = GameSocket;

@@ -1,344 +1,570 @@
-// routes.js
-
 const express = require('express');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const cloudinary = require('cloudinary').v2;
-const multer = require('multer');
-const { Readable } = require('stream');
-const crypto = require('crypto');
-const nodemailer = require('nodemailer');
-const { User, Item, RechargeRequest, WithdrawalRequest } = require('./models.js');
-
 const router = express.Router();
+const jwt = require('jsonwebtoken');
+const multer = require('multer');
+const cloudinary = require('cloudinary').v2;
+const nodemailer = require('nodemailer');
+const { isAuthenticated, isAdmin } = require('./middleware/auth');
+const { User, PaymentRequest, GameMatch, Transaction, ResetCode } = require('./models');
 
-// --- Middlewares de Autenticação ---
-const auth = async (req, res, next) => {
-    try {
-        const token = req.header('Authorization').replace('Bearer ', '');
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        req.user = await User.findById(decoded.id).select('-password');
-        if (!req.user || req.user.isBlocked) throw new Error();
-        next();
-    } catch (error) {
-        res.status(401).send({ error: 'Autenticação necessária.' });
-    }
-};
+// Multer configuration for file uploads
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB limit
+  }
+});
 
-const adminAuth = (req, res, next) => {
-    if (req.user?.role === 'admin') {
-        return next();
-    }
-    return res.status(403).json({ message: 'Acesso negado. Requer privilégios de administrador.' });
-};
-
-// --- Configuração de Upload ---
-const storage = multer.memoryStorage();
-const upload = multer({ storage });
-
-
-// ===================================
-// --- ROTAS DE AUTENTICAÇÃO E USUÁRIO ---
-// ===================================
-
+// Authentication Routes
 router.post('/auth/register', async (req, res) => {
+  try {
     const { username, email, password } = req.body;
-    if (!username || !email || !password) {
-        return res.status(400).json({ message: 'Por favor, preencha todos os campos.' });
+
+    // Check if user already exists
+    const userExists = await User.findOne({ $or: [{ email }, { username }] });
+    if (userExists) {
+      return res.status(400).json({ message: 'Username or email already exists' });
     }
-    try {
-        if (await User.findOne({ $or: [{ email }, { username }] })) {
-            return res.status(400).json({ message: 'Usuário ou email já existe.' });
-        }
-        const user = new User({ username, email, password });
-        await user.save();
-        const token = jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '30d' });
-        res.status(201).json({ token, user: { id: user._id, username: user.username } });
-    } catch (error) {
-        res.status(500).json({ message: 'Erro no servidor', error: error.message });
-    }
+
+    // Create new user
+    const user = new User({ username, email, password });
+    await user.save();
+
+    // Generate JWT
+    const token = jwt.sign(
+      { id: user._id, role: user.role },
+      process.env.JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+
+    res.status(201).json({
+      token,
+      user: {
+        id: user._id,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+        avatar: user.avatar
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Error creating user', error: error.message });
+  }
 });
 
 router.post('/auth/login', async (req, res) => {
+  try {
     const { email, password } = req.body;
-    try {
-        const user = await User.findOne({ email });
-        if (!user || !(await bcrypt.compare(password, user.password)) || user.isBlocked) {
-            return res.status(400).json({ message: 'Credenciais inválidas ou conta bloqueada.' });
+
+    // Find user and check if blocked
+    const user = await User.findOne({ email });
+    if (!user || user.isBlocked) {
+      return res.status(401).json({ message: 'Invalid credentials or account blocked' });
+    }
+
+    // Verify password
+    const isMatch = await user.comparePassword(password);
+    if (!isMatch) {
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
+
+    // Generate JWT
+    const token = jwt.sign(
+      { id: user._id, role: user.role },
+      process.env.JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+
+    res.json({
+      token,
+      user: {
+        id: user._id,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+        avatar: user.avatar,
+        balance: user.balance,
+        stats: user.stats
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Error during login', error: error.message });
+  }
+});
+
+// Profile Routes
+router.get('/profile/me', isAuthenticated, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id).select('-password');
+    res.json(user);
+  } catch (error) {
+    res.status(500).json({ message: 'Error fetching profile', error: error.message });
+  }
+});
+
+router.post('/profile/avatar', isAuthenticated, upload.single('avatar'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'No file uploaded' });
+    }
+
+    // Upload to Cloudinary
+    const result = await cloudinary.uploader.upload(req.file.buffer, {
+      folder: 'avatars',
+      resource_type: 'auto'
+    });
+
+    // Update user's avatar
+    const user = await User.findByIdAndUpdate(
+      req.user.id,
+      {
+        avatar: {
+          public_id: result.public_id,
+          url: result.secure_url
         }
-        const token = jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '30d' });
-        res.json({ token, user: { id: user._id, username: user.username } });
-    } catch (error) {
-        res.status(500).json({ message: 'Erro no servidor', error: error.message });
+      },
+      { new: true }
+    ).select('-password');
+
+    res.json(user);
+  } catch (error) {
+    res.status(500).json({ message: 'Error uploading avatar', error: error.message });
+  }
+});
+
+// Ranking Routes
+router.get('/ranking', async (req, res) => {
+  try {
+    const topPlayers = await User.find({ role: 'user' })
+      .sort({ totalWinnings: -1 })
+      .limit(100)
+      .select('username stats totalWinnings avatar.url');
+    
+    res.json(topPlayers);
+  } catch (error) {
+    res.status(500).json({ message: 'Error fetching ranking', error: error.message });
+  }
+});
+
+// Transaction Routes
+router.get('/transactions', isAuthenticated, async (req, res) => {
+  try {
+    const { type, page = 1, limit = 20 } = req.query;
+    const query = { user: req.user.id };
+    
+    if (type) {
+      query.type = type;
     }
+
+    const transactions = await Transaction.find(query)
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .populate('relatedMatch', 'roomCode')
+      .populate('relatedPaymentRequest', 'status');
+
+    const total = await Transaction.countDocuments(query);
+
+    res.json({
+      transactions,
+      totalPages: Math.ceil(total / limit),
+      currentPage: page
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Error fetching transactions', error: error.message });
+  }
 });
 
-router.post('/auth/forgot-password', async (req, res) => {
-    try {
-        const user = await User.findOne({ email: req.body.email });
-        if (!user) {
-            return res.status(200).json({ message: 'Se um usuário com este email existir, um link de redefinição de senha foi enviado.' });
-        }
+// Payment Routes
+router.post('/payments/recharge-request', isAuthenticated, upload.single('proof'), async (req, res) => {
+  try {
+    const { amount } = req.body;
 
-        const resetToken = crypto.randomBytes(20).toString('hex');
-
-        user.passwordResetToken = crypto.createHash('sha256').update(resetToken).digest('hex');
-        user.passwordResetExpires = Date.now() + 10 * 60 * 1000; // 10 minutos
-        await user.save();
-
-        const resetURL = `${process.env.FRONTEND_URL}/reset-password/${resetToken}`;
-
-        const message = `Você está recebendo este email porque solicitou a redefinição da senha da sua conta.\n\n` +
-                        `Por favor, clique no seguinte link para completar o processo:\n\n` +
-                        `${resetURL}\n\n` +
-                        `Se você não solicitou isso, ignore este email.\n`;
-
-        const transporter = nodemailer.createTransport({
-            service: 'gmail',
-            auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
-        });
-
-        await transporter.sendMail({
-            from: `"Plataforma de Damas" <${process.env.EMAIL_USER}>`,
-            to: user.email,
-            subject: 'Redefinição de Senha',
-            text: message
-        });
-
-        res.status(200).json({ message: 'Se um usuário com este email existir, um link de redefinição de senha foi enviado.' });
-
-    } catch (error) {
-        res.status(500).json({ message: 'Erro ao enviar o email. Tente novamente mais tarde.' });
+    if (!req.file) {
+      return res.status(400).json({ message: 'Proof of payment is required' });
     }
+
+    // Upload proof to Cloudinary
+    const result = await cloudinary.uploader.upload(req.file.buffer, {
+      folder: 'payment_proofs',
+      resource_type: 'auto'
+    });
+
+    // Create payment request
+    const paymentRequest = new PaymentRequest({
+      user: req.user.id,
+      type: 'recharge',
+      amount: parseFloat(amount),
+      proofOfPayment: {
+        public_id: result.public_id,
+        url: result.secure_url
+      }
+    });
+    await paymentRequest.save();
+
+    // Create transaction record
+    const transaction = new Transaction({
+      user: req.user.id,
+      type: 'recharge',
+      amount: parseFloat(amount),
+      status: 'pending',
+      description: 'Recharge request submitted',
+      relatedPaymentRequest: paymentRequest._id,
+      balanceAfter: req.user.balance
+    });
+    await transaction.save();
+
+    res.status(201).json(paymentRequest);
+  } catch (error) {
+    res.status(500).json({ message: 'Error creating recharge request', error: error.message });
+  }
 });
 
-router.post('/auth/reset-password/:token', async (req, res) => {
-    const hashedToken = crypto.createHash('sha256').update(req.params.token).digest('hex');
-    try {
-        const user = await User.findOne({
-            passwordResetToken: hashedToken,
-            passwordResetExpires: { $gt: Date.now() }
-        });
+router.post('/payments/withdraw-request', isAuthenticated, async (req, res) => {
+  try {
+    const { amount } = req.body;
+    const user = await User.findById(req.user.id);
 
-        if (!user) {
-            return res.status(400).json({ message: 'Token inválido ou expirado.' });
-        }
-
-        user.password = req.body.password;
-        user.passwordResetToken = undefined;
-        user.passwordResetExpires = undefined;
-        await user.save();
-
-        const loginToken = jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '30d' });
-        res.status(200).json({ token: loginToken, message: 'Senha redefinida com sucesso!' });
-    } catch (error) {
-        res.status(500).json({ message: 'Erro ao redefinir a senha.' });
+    if (user.balance < amount) {
+      return res.status(400).json({ message: 'Insufficient balance' });
     }
+
+    // Create withdrawal request
+    const paymentRequest = new PaymentRequest({
+      user: req.user.id,
+      type: 'withdraw',
+      amount: parseFloat(amount)
+    });
+    await paymentRequest.save();
+
+    // Update user balance
+    user.balance -= parseFloat(amount);
+    await user.save();
+
+    // Create transaction record
+    const transaction = new Transaction({
+      user: req.user.id,
+      type: 'withdrawal',
+      amount: -parseFloat(amount),
+      status: 'pending',
+      description: 'Withdrawal request submitted',
+      relatedPaymentRequest: paymentRequest._id,
+      balanceAfter: user.balance
+    });
+    await transaction.save();
+
+    res.status(201).json(paymentRequest);
+  } catch (error) {
+    res.status(500).json({ message: 'Error creating withdrawal request', error: error.message });
+  }
 });
 
-// ===============================
-// --- ROTAS DE PERFIL E RANKING ---
-// ===============================
+// Admin Routes
+router.get('/admin/stats', isAdmin, async (req, res) => {
+  try {
+    const stats = await Promise.all([
+      User.countDocuments({ role: 'user' }),
+      PaymentRequest.countDocuments({ status: 'pending' }),
+      Transaction.aggregate([
+        { $match: { type: { $in: ['recharge', 'withdrawal'] }, status: 'completed' } },
+        { $group: {
+          _id: '$type',
+          total: { $sum: '$amount' }
+        }}
+      ])
+    ]);
 
-router.get('/profile/me', auth, async (req, res) => {
-    try {
-        const userProfile = await User.findById(req.user.id)
-            .populate([{ path: 'inventory' }, { path: 'equippedItems.piece_skin' }, { path: 'equippedItems.board_skin' }])
-            .select('-password -__v');
-            
-        if (!userProfile) return res.status(404).json({ message: 'Usuário não encontrado.' });
-        res.json(userProfile);
-    } catch (error) {
-        console.error("Erro na rota /profile/me: ", error);
-        res.status(500).json({ message: 'Erro interno ao buscar dados do perfil.' });
+    res.json({
+      totalUsers: stats[0],
+      pendingRequests: stats[1],
+      financialStats: stats[2]
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Error fetching admin stats', error: error.message });
+  }
+});
+
+router.get('/admin/payment-requests', isAdmin, async (req, res) => {
+  try {
+    const { status, type, page = 1, limit = 20 } = req.query;
+    const query = {};
+    
+    if (status) query.status = status;
+    if (type) query.type = type;
+
+    const requests = await PaymentRequest.find(query)
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .populate('user', 'username email');
+
+    const total = await PaymentRequest.countDocuments(query);
+
+    res.json({
+      requests,
+      totalPages: Math.ceil(total / limit),
+      currentPage: page
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Error fetching payment requests', error: error.message });
+  }
+});
+
+router.post('/admin/payment-requests/:id/process', isAdmin, async (req, res) => {
+  try {
+    const { status, notes } = req.body;
+    const request = await PaymentRequest.findById(req.params.id)
+      .populate('user');
+
+    if (!request) {
+      return res.status(404).json({ message: 'Payment request not found' });
     }
-});
 
-router.put('/profile/username', auth, async (req, res) => {
-    const { newUsername } = req.body;
-    const cost = 100;
-    try {
-        if (req.user.balance < cost) return res.status(400).json({ message: 'Saldo insuficiente.' });
-        if (await User.findOne({ username: newUsername })) return res.status(400).json({ message: 'Nome de usuário já em uso.' });
-        req.user.username = newUsername;
-        req.user.balance -= cost;
-        await req.user.save();
-        res.json({ message: 'Nome de usuário alterado com sucesso!', newBalance: req.user.balance });
-    } catch (error) { res.status(500).json({ message: 'Erro no servidor' }); }
-});
+    request.status = status;
+    request.notes = notes;
+    request.processedBy = req.user.id;
+    request.processedAt = new Date();
+    await request.save();
 
-router.post('/profile/avatar', auth, upload.single('avatar'), async (req, res) => {
-    if (!req.file) return res.status(400).json({ message: 'Nenhum arquivo enviado.' });
-    try {
-        if (req.user.avatar && req.user.avatar.public_id) await cloudinary.uploader.destroy(req.user.avatar.public_id);
-        const stream = cloudinary.uploader.upload_stream({ folder: "avatars" }, async (error, result) => {
-            if (error) return res.status(500).json({ message: 'Falha no upload' });
-            req.user.avatar = { public_id: result.public_id, url: result.secure_url };
-            await req.user.save();
-            res.json({ message: 'Avatar atualizado!', avatarUrl: result.secure_url });
-        });
-        Readable.from(req.file.buffer).pipe(stream);
-    } catch (error) { res.status(500).json({ message: 'Erro no servidor' }); }
-});
+    const transaction = await Transaction.findOne({ relatedPaymentRequest: request._id });
+    transaction.status = status === 'approved' ? 'completed' : 'failed';
+    await transaction.save();
 
-router.get('/ranking', auth, async(req, res) => {
-    try {
-        const leaderboard = await User.find({ role: 'user' }).sort({ rankingPoints: -1 }).limit(100).select('username rankingPoints level stats.wins avatar.url');
-        res.json(leaderboard);
-    } catch (error) { res.status(500).json({ message: 'Erro ao buscar o ranking.'}); }
-});
-
-// =======================================
-// --- ROTAS DA LOJA, PAGAMENTOS E SAQUES ---
-// =======================================
-
-router.get('/shop/items', auth, async (req, res) => {
-    try { res.json(await Item.find()); } catch (error) { res.status(500).json({ message: 'Erro no servidor' }); }
-});
-
-router.post('/shop/buy/:itemId', auth, async (req, res) => {
-    try {
-        const item = await Item.findById(req.params.itemId);
-        if (!item) return res.status(404).json({ message: 'Item não encontrado.' });
-        if (req.user.inventory.includes(item._id)) return res.status(400).json({ message: 'Você já possui este item.' });
-        if (req.user.balance < item.price) return res.status(400).json({ message: 'Saldo insuficiente.' });
-        req.user.balance -= item.price;
-        req.user.inventory.push(item._id);
-        await req.user.save();
-        res.json({ message: `Item '${item.name}' comprado com sucesso!`, newBalance: req.user.balance });
-    } catch (error) { res.status(500).json({ message: 'Erro no servidor' }); }
-});
-
-router.post('/inventory/equip', auth, async (req, res) => {
-    const { itemId } = req.body;
-    try {
-        const item = await Item.findById(itemId);
-        if (!item || !req.user.inventory.includes(itemId)) return res.status(404).json({ message: 'Item inválido.' });
-        if (item.type === 'piece_skin') req.user.equippedItems.piece_skin = item._id;
-        else if (item.type === 'board_skin') req.user.equippedItems.board_skin = item._id;
-        await req.user.save();
-        res.json({ message: `'${item.name}' equipado!`, equippedItems: req.user.equippedItems });
-    } catch (error) { res.status(500).json({ message: 'Erro no servidor' }); }
-});
-
-router.post('/payments/recharge-request', auth, async (req, res) => {
-    const { amount, paymentMethod, transactionId } = req.body;
-    try {
-        const request = new RechargeRequest({ user: req.user._id, amount, paymentMethod, transactionId });
-        await request.save();
-        res.status(201).json({ message: 'Pedido de recarga enviado. Aguardando aprovação.' });
-    } catch (error) { res.status(500).json({ message: "Erro ao processar pedido." }); }
-});
-
-router.post('/payments/withdraw-request', auth, async (req, res) => {
-    const { amount, paymentMethod, userPaymentDetails } = req.body;
-    if (!amount || !paymentMethod || !userPaymentDetails) return res.status(400).json({ message: 'Todos os campos são obrigatórios.' });
-    if (req.user.balance < amount) return res.status(400).json({ message: 'Saldo insuficiente.' });
-    try {
-        req.user.balance -= amount;
-        const withdrawal = new WithdrawalRequest({ user: req.user._id, amount, paymentMethod, userPaymentDetails });
-        await Promise.all([withdrawal.save(), req.user.save()]);
-        res.status(201).json({ message: 'Pedido de saque enviado com sucesso.', newBalance: req.user.balance });
-    } catch (error) { res.status(500).json({ message: "Erro ao processar pedido." }); }
-});
-
-// ===============================
-// --- ROTAS DO PAINEL DE ADMIN ---
-// ===============================
-
-router.get('/admin/stats', auth, adminAuth, async (req, res) => {
-    try {
-        const [pendingRecharges, pendingWithdrawals, totalUsers, totalItems] = await Promise.all([
-            RechargeRequest.countDocuments({ status: 'pending' }),
-            WithdrawalRequest.countDocuments({ status: 'pending' }),
-            User.countDocuments(),
-            Item.countDocuments()
-        ]);
-        res.json({ pendingRecharges, pendingWithdrawals, totalUsers, totalItems });
-    } catch (error) { res.status(500).json({ message: 'Erro ao buscar estatísticas.' }); }
-});
-
-router.get('/admin/users', auth, adminAuth, async (req, res) => {
-    try {
-        const searchQuery = req.query.search || '';
-        const users = await User.find({
-            $or: [{ username: { $regex: searchQuery, $options: 'i' } }, { email: { $regex: searchQuery, $options: 'i' } }]
-        }).limit(20);
-        res.json(users);
-    } catch (e) { res.status(500).send({ message: 'Erro ao buscar usuários.' }); }
-});
-
-router.get('/admin/recharge-requests', auth, adminAuth, async (req, res) => {
-    try { res.json(await RechargeRequest.find({ status: 'pending' }).populate('user', 'username email')); }
-    catch (e) { res.status(500).send(); }
-});
-
-router.post('/admin/recharge-requests/approve/:id', auth, adminAuth, async (req, res) => {
-    try {
-        const request = await RechargeRequest.findById(req.params.id);
-        if (!request || request.status !== 'pending') return res.status(404).json({ message: 'Pedido inválido ou já processado.' });
-        await User.findByIdAndUpdate(request.user, { $inc: { balance: request.amount } });
-        request.status = 'approved';
-        await request.save();
-        res.json({ message: 'Recarga aprovada com sucesso.' });
-    } catch (e) { res.status(500).send(); }
-});
-
-router.get('/admin/withdraw-requests', auth, adminAuth, async (req, res) => {
-    try { res.json(await WithdrawalRequest.find({ status: 'pending' }).populate('user', 'username email')); }
-    catch (e) { res.status(500).send(); }
-});
-
-router.post('/admin/withdraw-requests/approve/:id', auth, adminAuth, async (req, res) => {
-    try {
-        const request = await WithdrawalRequest.findByIdAndUpdate(req.params.id, { status: 'approved' });
-        if (!request) return res.status(404).json({ message: 'Pedido de saque não encontrado.' });
-        res.json({ message: 'Saque aprovado e marcado como concluído no sistema.' });
-    } catch (e) { res.status(500).send(); }
-});
-
-router.post('/admin/users/block/:id', auth, adminAuth, async (req, res) => {
-    try {
-        const user = await User.findByIdAndUpdate(req.params.id, { isBlocked: true });
-        if (!user) return res.status(404).json({ message: 'Usuário não encontrado.' });
-        res.json({ message: `Usuário ${user.username} foi bloqueado.` });
-    } catch (e) { res.status(500).send(); }
-});
-
-router.post('/admin/users/unblock/:id', auth, adminAuth, async (req, res) => {
-    try {
-        const user = await User.findByIdAndUpdate(req.params.id, { isBlocked: false });
-        if (!user) return res.status(404).json({ message: 'Usuário não encontrado.' });
-        res.json({ message: `Usuário ${user.username} foi desbloqueado.` });
-    } catch (e) { res.status(500).send(); }
-});
-
-router.post('/admin/items', auth, adminAuth, upload.single('itemImage'), async (req, res) => {
-    const { name, type, price, identifier } = req.body;
-    if (!name || !type || !price || !identifier || !req.file) {
-        return res.status(400).json({ message: 'Todos os campos, incluindo a imagem, são obrigatórios.' });
+    if (status === 'approved' && request.type === 'recharge') {
+      request.user.balance += request.amount;
+      await request.user.save();
     }
-    try {
-        const result = await new Promise((resolve, reject) => {
-            const stream = cloudinary.uploader.upload_stream({ folder: "items" }, (error, result) => {
-                if (error) reject(error); resolve(result);
-            });
-            Readable.from(req.file.buffer).pipe(stream);
-        });
-        const newItem = new Item({ name, type, price: Number(price), identifier, imageUrl: { public_id: result.public_id, url: result.secure_url } });
-        await newItem.save();
-        res.status(201).json(newItem);
-    } catch (error) { res.status(500).json({ message: 'Erro no servidor ao adicionar item', error: error.message }); }
+
+    res.json(request);
+  } catch (error) {
+    res.status(500).json({ message: 'Error processing payment request', error: error.message });
+  }
 });
 
-router.delete('/admin/items/:id', auth, adminAuth, async (req, res) => {
-    try {
-        const item = await Item.findByIdAndDelete(req.params.id);
-        if (!item) return res.status(404).json({ message: "Item não encontrado." });
-        if (item.imageUrl && item.imageUrl.public_id) await cloudinary.uploader.destroy(item.imageUrl.public_id);
-        res.json({ message: "Item removido com sucesso." });
-    } catch (error) { res.status(500).json({ message: 'Erro no servidor ao remover item', error: error.message }); }
+router.get('/admin/users', isAdmin, async (req, res) => {
+  try {
+    const { search, page = 1, limit = 20 } = req.query;
+    const query = { role: 'user' };
+    
+    if (search) {
+      query.$or = [
+        { username: new RegExp(search, 'i') },
+        { email: new RegExp(search, 'i') }
+      ];
+    }
+
+    const users = await User.find(query)
+      .select('-password')
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit);
+
+    const total = await User.countDocuments(query);
+
+    res.json({
+      users,
+      totalPages: Math.ceil(total / limit),
+      currentPage: page
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Error fetching users', error: error.message });
+  }
 });
 
+router.post('/admin/users/:id/block', isAdmin, async (req, res) => {
+  try {
+    const user = await User.findByIdAndUpdate(
+      req.params.id,
+      { isBlocked: true },
+      { new: true }
+    ).select('-password');
+
+    res.json(user);
+  } catch (error) {
+    res.status(500).json({ message: 'Error blocking user', error: error.message });
+  }
+});
+
+router.post('/admin/users/:id/unblock', isAdmin, async (req, res) => {
+  try {
+    const user = await User.findByIdAndUpdate(
+      req.params.id,
+      { isBlocked: false },
+      { new: true }
+    ).select('-password');
+
+    res.json(user);
+  } catch (error) {
+    res.status(500).json({ message: 'Error unblocking user', error: error.message });
+  }
+});
+
+// Password Reset Routes (New)
+const generateResetCode = () => {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+};
+
+router.post('/auth/request-reset-code', async (req, res) => {
+  try {
+    const { email } = req.body;
+    const user = await User.findOne({ email });
+
+    if (!user) {
+      return res.json({ message: 'Se o email existir, você receberá um código de redefinição.' });
+    }
+
+    const resetCode = generateResetCode();
+
+    await ResetCode.create({
+      user: user._id,
+      code: resetCode
+    });
+
+    const mailOptions = {
+      from: process.env.GMAIL_USER,
+      to: email,
+      subject: 'Código de Redefinição de Senha - Plataforma de Damas Online',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2 style="color: #f97316;">Redefinição de Senha</h2>
+          <p>Você solicitou a redefinição de sua senha na Plataforma de Damas Online.</p>
+          <p>Use o código abaixo para redefinir sua senha:</p>
+          <div style="text-align: center; margin: 30px 0;">
+            <div style="background-color: #f0f0f0; 
+                        padding: 20px; 
+                        font-size: 24px; 
+                        letter-spacing: 5px;
+                        font-weight: bold;
+                        border-radius: 5px;">
+              ${resetCode}
+            </div>
+          </div>
+          <p>Este código é válido por 15 minutos.</p>
+          <p>Se você não solicitou esta redefinição, ignore este email.</p>
+          <hr style="border: 1px solid #eee; margin: 20px 0;">
+          <p style="color: #666; font-size: 12px;">
+            Este é um email automático. Por favor, não responda.
+          </p>
+        </div>
+      `
+    };
+
+    const transporter = nodemailer.createTransport({
+      service: 'gmail',
+      auth: {
+        user: process.env.GMAIL_USER,
+        pass: process.env.GMAIL_APP_PASSWORD
+      }
+    });
+
+    await transporter.sendMail(mailOptions);
+
+    res.json({ 
+      message: 'Se o email existir, você receberá um código de redefinição.',
+      success: true
+    });
+  } catch (error) {
+    console.error('Password reset request error:', error);
+    res.status(500).json({ 
+      message: 'Erro ao processar solicitação de redefinição de senha',
+      success: false
+    });
+  }
+});
+
+router.post('/auth/reset-password', async (req, res) => {
+  try {
+    const { code, email, newPassword } = req.body;
+
+    if (!code || !email || !newPassword) {
+      return res.status(400).json({
+        message: 'Código, email e nova senha são obrigatórios',
+        success: false
+      });
+    }
+
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(400).json({
+        message: 'Código inválido ou expirado',
+        success: false
+      });
+    }
+
+    const resetCodeDoc = await ResetCode.findOne({
+      user: user._id,
+      code: code
+    });
+
+    if (!resetCodeDoc) {
+      return res.status(400).json({
+        message: 'Código inválido ou expirado',
+        success: false
+      });
+    }
+
+    user.password = newPassword;
+    await user.save();
+
+    await ResetCode.deleteOne({ _id: resetCodeDoc._id });
+
+    res.json({
+      message: 'Senha atualizada com sucesso',
+      success: true
+    });
+  } catch (error) {
+    console.error('Password reset error:', error);
+    res.status(500).json({
+      message: 'Erro ao redefinir senha',
+      success: false
+    });
+  }
+});
+
+router.post('/auth/verify-reset-code', async (req, res) => {
+  try {
+    const { code, email } = req.body;
+
+    if (!code || !email) {
+      return res.status(400).json({
+        message: 'Código e email são obrigatórios',
+        success: false
+      });
+    }
+
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(400).json({
+        message: 'Código inválido ou expirado',
+        success: false
+      });
+    }
+
+    const resetCodeDoc = await ResetCode.findOne({
+      user: user._id,
+      code: code
+    });
+
+    if (!resetCodeDoc) {
+      return res.status(400).json({
+        valid: false,
+        message: 'Código inválido ou expirado',
+        success: false
+      });
+    }
+
+    res.json({
+      valid: true,
+      message: 'Código válido',
+      success: true
+    });
+  } catch (error) {
+    console.error('Code verification error:', error);
+    res.status(500).json({
+      message: 'Erro ao verificar código',
+      success: false
+    });
+  }
+});
 
 module.exports = router;
